@@ -4,11 +4,14 @@ import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import vertexShader from "./shaders/vertexShader.glsl";
 import fragmentShader from "./shaders/fragmentShader.glsl";
 import vertexSimulationShader from "./shaders/vertexSimulation.glsl";
-import fragmentSimulationShader from "./shaders/fragmentSimulation.glsl";
+import fragmentPositionSimulationShader from "./shaders/fragmentPositionSimulation.glsl";
+import fragmentSpeedSimulationShader from "./shaders/fragmentSpeedSimulation.glsl";
 import testTexture from "./test.png";
-import texture1 from "./logo.png";
+import earthTexture from "./earth.png";
+import texture1 from "./logo-black.png";
 import texture2 from "./seatreasure.png";
 import GUI from "lil-gui";
+import { GPUComputationRenderer } from "three/examples/jsm/misc/GPUComputationRenderer.js";
 
 function lerp(a, b, t) {
   return a * (1 - t) + b * t;
@@ -27,7 +30,7 @@ function loadImage(url) {
 export default class Sketch {
   constructor(options) {
     this.time = 0;
-    this.size = 1024;
+    this.size = 700;
     this.count = this.size * this.size;
     this.container = options.dom;
     this.scene = new THREE.Scene();
@@ -41,7 +44,7 @@ export default class Sketch {
       0.01,
       10
     );
-    this.camera.position.z = 1;
+    this.camera.position.z = 2;
 
     this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -52,19 +55,69 @@ export default class Sketch {
 
     this.setupSettings();
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
+    this.controls.autoRotate = true;
+    this.controls.autoRotateSpeed = 0.5;
 
-    Promise.all([
-      this.createDataTextureFromImage(texture1),
-      this.createDataTextureFromImage(texture2),
-    ]).then((textures) => {
-      this.data1 = textures[0];
-      this.data2 = textures[1];
-      this.mouseEvents();
-      this.setupResize();
-      this.addObjects();
-      this.setupFBO();
-      this.render();
-    });
+    this.data1 = this.createDataTextureOnSphere();
+    this.data2 = this.createDataTextureOnSphere();
+    this.mouseEvents();
+    this.setupResize();
+    this.addObjects();
+    this.initGPUComputationRenderer();
+    // this.setupFBO();
+    this.render();
+  }
+
+  createSpeedsTexture() {
+    const data = new Float32Array(this.count * 4);
+
+    for (let i = 0; i < this.count; i++) {
+      data[i * 4] = (Math.random() * 2 - 1) * 0.01;
+      data[i * 4 + 1] = (Math.random() * 2 - 1) * 0.01;
+      data[i * 4 + 2] = (Math.random() * 2 - 1) * 0.01;
+      data[i * 4 + 3] = 0;
+    }
+
+    const texture = new THREE.DataTexture(
+      data,
+      this.size,
+      this.size,
+      THREE.RGBAFormat,
+      THREE.FloatType
+    );
+    texture.needsUpdate = true;
+    return texture;
+  }
+
+  createDataTextureOnSphere() {
+    const data = new Float32Array(this.count * 4);
+
+    for (let i = 0; i < this.size; i++) {
+      for (let j = 0; j < this.size; j++) {
+        const index = i * this.size + j;
+
+        const alpha = Math.random() * Math.PI * 2;
+        const beta = Math.acos(Math.random() * 2 - 1);
+        const x = Math.sin(beta) * Math.cos(alpha);
+        const y = Math.sin(beta) * Math.sin(alpha);
+        const z = Math.cos(beta);
+
+        data[index * 4] = x;
+        data[index * 4 + 1] = y;
+        data[index * 4 + 2] = z;
+        data[index * 4 + 3] = 0;
+      }
+    }
+
+    const texture = new THREE.DataTexture(
+      data,
+      this.size,
+      this.size,
+      THREE.RGBAFormat,
+      THREE.FloatType
+    );
+    texture.needsUpdate = true;
+    return texture;
   }
 
   async createDataTextureFromImage(url) {
@@ -114,9 +167,10 @@ export default class Sketch {
     texture.needsUpdate = true;
     return texture;
   }
+
   mouseEvents() {
     this.testMesh = new THREE.Mesh(
-      new THREE.PlaneGeometry(10, 10),
+      new THREE.SphereGeometry(1, 30, 30),
       new THREE.MeshBasicMaterial()
     );
 
@@ -128,7 +182,8 @@ export default class Sketch {
       const intersects = this.raycster.intersectObjects([this.testMesh]);
       if (intersects.length > 0) {
         const { point } = intersects[0];
-        this.simulationMaterial.uniforms.uMouse.value = point;
+        this.positionVariable.material.uniforms.uMouse.value = point;
+        this.speedVariable.material.uniforms.uMouse.value = point;
       }
     });
   }
@@ -156,8 +211,8 @@ export default class Sketch {
     this.material = new THREE.ShaderMaterial({
       uniforms: {
         time: { value: 0 },
-        // uTexture: { value: new THREE.TextureLoader().load(testTexture) },
-        uTexture: { value: null },
+        uTexture: { value: new THREE.TextureLoader().load(testTexture) },
+        // uTexture: { value: null },
         uImage: { value: new THREE.TextureLoader().load(texture2) },
       },
       depthTest: false,
@@ -174,25 +229,32 @@ export default class Sketch {
 
   render() {
     this.time += 0.05;
+    this.controls.update();
 
     this.material.uniforms.time.value = this.time;
     this.material.uniforms.needsUpdate = true;
 
-    this.simulationMaterial.uniforms.time.value = this.time;
-    this.simulationMaterial.uniforms.needsUpdate = true;
-
-    this.renderer.setRenderTarget(this.rendererTargetFBO);
-    this.renderer.render(this.sceneFBO, this.cameraFBO);
-    this.renderer.setRenderTarget(null);
+    // this.simulationMaterial.uniforms.time.value = this.time;
+    // this.simulationMaterial.uniforms.needsUpdate = true;
+    this.positionVariable.material.uniforms.time.value = this.time;
+    this.positionVariable.material.uniforms.needsUpdate = true;
+    this.speedVariable.material.uniforms.time.value = this.time;
+    this.speedVariable.material.uniforms.needsUpdate = true;
+    this.gpuCompute.compute();
+    // this.renderer.setRenderTarget(this.rendererTargetFBO);
+    // this.renderer.render(this.sceneFBO, this.cameraFBO);
+    // this.renderer.setRenderTarget(null);
     this.renderer.render(this.scene, this.camera);
 
-    const temp = this.rendererTargetFBO;
-    this.rendererTargetFBO = this.rendererTargetFBO1;
-    this.rendererTargetFBO1 = temp;
+    // const temp = this.rendererTargetFBO;
+    // this.rendererTargetFBO = this.rendererTargetFBO1;
+    // this.rendererTargetFBO1 = temp;
+    //
+    this.material.uniforms.uTexture.value =
+      this.gpuCompute.getCurrentRenderTarget(this.positionVariable).texture;
 
-    this.material.uniforms.uTexture.value = this.rendererTargetFBO.texture;
-    this.simulationMaterial.uniforms.uCurrentPositions.value =
-      this.rendererTargetFBO1.texture;
+    // this.simulationMaterial.uniforms.uCurrentPositions.value =
+    //   this.rendererTargetFBO1.texture;
 
     window.requestAnimationFrame(this.render.bind(this));
   }
@@ -209,6 +271,68 @@ export default class Sketch {
     window.addEventListener("resize", this.resize.bind(this));
   }
 
+  initGPUComputationRenderer() {
+    this.gpuCompute = new GPUComputationRenderer(
+      this.size,
+      this.size,
+      this.renderer
+    );
+
+    this.positionVariable = this.gpuCompute.addVariable(
+      "uCurrentPositions",
+      fragmentPositionSimulationShader,
+      this.data1
+    );
+
+    this.speedVariable = this.gpuCompute.addVariable(
+      "uCurrentSpeed",
+      fragmentSpeedSimulationShader,
+      this.createSpeedsTexture()
+    );
+
+    this.positionVariable.material.uniforms.time = { value: 0 };
+    this.positionVariable.material.uniforms.uOriginalPositions = {
+      value: this.data1,
+    };
+    this.positionVariable.material.uniforms.uOriginalPositions1 = {
+      value: this.data2,
+    };
+    this.positionVariable.material.uniforms.uMouse = {
+      value: new THREE.Vector3(0, 0, 0),
+    };
+    this.positionVariable.material.uniforms.progress = {
+      value: 0,
+    };
+
+    this.speedVariable.material.uniforms.time = { value: 0 };
+    this.speedVariable.material.uniforms.uOriginalPositions = {
+      value: this.data1,
+    };
+    this.speedVariable.material.uniforms.uOriginalPositions1 = {
+      value: this.data2,
+    };
+    this.speedVariable.material.uniforms.uMouse = {
+      value: new THREE.Vector3(0, 0, 0),
+    };
+    this.speedVariable.material.uniforms.progress = {
+      value: 0,
+    };
+
+    this.gpuCompute.setVariableDependencies(this.positionVariable, [
+      this.positionVariable,
+      this.speedVariable,
+    ]);
+
+    this.gpuCompute.setVariableDependencies(this.speedVariable, [
+      this.positionVariable,
+      this.speedVariable,
+    ]);
+    const error = this.gpuCompute.init();
+
+    if (error !== null) {
+      console.error(error);
+    }
+  }
   setupFBO() {
     this.sceneFBO = new THREE.Scene();
     this.cameraFBO = new THREE.OrthographicCamera(-1, 1, 1, -1, -2, 2);
@@ -225,7 +349,7 @@ export default class Sketch {
         time: { value: 0 },
       },
       vertexShader: vertexSimulationShader,
-      fragmentShader: fragmentSimulationShader,
+      fragmentShader: fragmentPositionSimulationShader,
     });
     this.simulationMesh = new THREE.Mesh(geometryFBO, this.simulationMaterial);
     this.sceneFBO.add(this.simulationMesh);
@@ -255,7 +379,10 @@ export default class Sketch {
     };
     this.gui = new GUI();
     this.gui.add(this.settings, "progress", 0, 1, 0.01).onChange(() => {
-      this.simulationMaterial.uniforms.progress.value = this.settings.progress;
+      this.positionVariable.material.uniforms.progress.value =
+        this.settings.progress;
+      this.speedVariable.material.uniforms.progress.value =
+        this.settings.progress;
     });
   }
 }
